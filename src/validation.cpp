@@ -464,6 +464,11 @@ public:
          * policies such as mempool min fee and min relay fee.
          */
         const bool m_package_feerates;
+        /** Used for local submission of transactions to catch "absurd" fees
+         * due to fee miscalulation by wallets. std:nullopt implies unset, allowing any feerates.
+         * Any individual transaction failing this check causes immediate failure.
+         */
+        const std::optional<CFeeRate> m_max_sane_feerate;
 
         /** Parameters for single transaction mempool validation. */
         static ATMPArgs SingleAccept(const CChainParams& chainparams, int64_t accept_time,
@@ -477,6 +482,7 @@ public:
                             /* m_allow_replacement */ true,
                             /* m_package_submission */ false,
                             /* m_package_feerates */ false,
+                            /* m_max_sane_feerate */ {}, // checked by caller
             };
         }
 
@@ -491,12 +497,13 @@ public:
                             /* m_allow_replacement */ false,
                             /* m_package_submission */ false, // not submitting to mempool
                             /* m_package_feerates */ false,
+                            /* m_max_sane_feerate */ {}, // checked by caller
             };
         }
 
         /** Parameters for child-with-unconfirmed-parents package validation. */
         static ATMPArgs PackageChildWithParents(const CChainParams& chainparams, int64_t accept_time,
-                                                std::vector<COutPoint>& coins_to_uncache) {
+                                                std::vector<COutPoint>& coins_to_uncache, std::optional<CFeeRate>& max_sane_feerate) {
             return ATMPArgs{/* m_chainparams */ chainparams,
                             /* m_accept_time */ accept_time,
                             /* m_bypass_limits */ false,
@@ -505,6 +512,7 @@ public:
                             /* m_allow_replacement */ false,
                             /* m_package_submission */ true,
                             /* m_package_feerates */ true,
+                            /* m_max_sane_feerate */ max_sane_feerate,
             };
         }
 
@@ -518,6 +526,7 @@ public:
                             /* m_allow_replacement */ true,
                             /* m_package_submission */ true, // do not LimitMempoolSize in Finalize()
                             /* m_package_feerates */ false, // only 1 transaction
+                            /* m_max_sane_feerate */ package_args.m_max_sane_feerate,
             };
         }
 
@@ -531,7 +540,8 @@ public:
                  bool test_accept,
                  bool allow_replacement,
                  bool package_submission,
-                 bool package_feerates)
+                 bool package_feerates,
+                 std::optional<CFeeRate> max_sane_feerate)
             : m_chainparams{chainparams},
               m_accept_time{accept_time},
               m_bypass_limits{bypass_limits},
@@ -539,7 +549,8 @@ public:
               m_test_accept{test_accept},
               m_allow_replacement{allow_replacement},
               m_package_submission{package_submission},
-              m_package_feerates{package_feerates}
+              m_package_feerates{package_feerates},
+              m_max_sane_feerate{max_sane_feerate}
         {
         }
     };
@@ -1243,6 +1254,12 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(const CTransactionRef
         return MempoolAcceptResult::Failure(ws.m_state);
     }
 
+    // Individual modified feerate exceeded caller-deemed "sane" max; abort
+    if (args.m_max_sane_feerate && CFeeRate(ws.m_modified_fees, ws.m_vsize) > args.m_max_sane_feerate.value()) {
+        ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "max sane feerate exceeded", "");
+        return MempoolAcceptResult::Failure(ws.m_state);
+    }
+
     if (m_rbf && !ReplacementChecks(ws)) return MempoolAcceptResult::Failure(ws.m_state);
 
     // Perform the inexpensive checks first and avoid hashing and signature verification unless
@@ -1295,6 +1312,15 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             return PackageMempoolAcceptResult(package_state, std::move(results));
         }
+
+        // Individual modified feerate exceeded caller-deemed "sane" max; abort
+        if (args.m_max_sane_feerate && CFeeRate(ws.m_modified_fees, ws.m_vsize) > args.m_max_sane_feerate.value()) {
+            package_state.Invalid(PackageValidationResult::PCKG_TX, "max sane feerate exceeded");
+            // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
+            results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+            return PackageMempoolAcceptResult(package_state, std::move(results));
+        }
+
         // Make the coins created by this transaction available for subsequent transactions in the
         // package to spend. Since we already checked conflicts in the package and we don't allow
         // replacements, we don't need to track the coins spent. Note that this logic will need to be
@@ -1630,7 +1656,7 @@ MempoolAcceptResult AcceptToMemoryPool(Chainstate& active_chainstate, const CTra
 }
 
 PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxMemPool& pool,
-                                                   const Package& package, bool test_accept)
+                                                   const Package& package, bool test_accept, std::optional<CFeeRate> max_sane_feerate)
 {
     AssertLockHeld(cs_main);
     assert(!package.empty());
@@ -1644,7 +1670,7 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
             auto args = MemPoolAccept::ATMPArgs::PackageTestAccept(chainparams, GetTime(), coins_to_uncache);
             return MemPoolAccept(pool, active_chainstate).AcceptMultipleTransactions(package, args);
         } else {
-            auto args = MemPoolAccept::ATMPArgs::PackageChildWithParents(chainparams, GetTime(), coins_to_uncache);
+            auto args = MemPoolAccept::ATMPArgs::PackageChildWithParents(chainparams, GetTime(), coins_to_uncache, max_sane_feerate);
             return MemPoolAccept(pool, active_chainstate).AcceptPackage(package, args);
         }
     }();

@@ -270,7 +270,7 @@ FUZZ_TARGET(tx_package_eval, .init = initialize_tx_pool)
         auto single_submit = txs.size() == 1 && fuzzed_data_provider.ConsumeBool();
 
         const auto result_package = WITH_LOCK(::cs_main,
-                                    return ProcessNewPackage(chainstate, tx_pool, txs, /*test_accept=*/single_submit));
+                                    return ProcessNewPackage(chainstate, tx_pool, txs, /*test_accept=*/single_submit, /*max_sane_feerate=*/{}));
 
         const auto res = WITH_LOCK(::cs_main, return AcceptToMemoryPool(chainstate, txs.back(), GetTime(), bypass_limits, /*test_accept=*/!single_submit));
         const bool accepted = res.m_result_type == MempoolAcceptResult::ResultType::VALID;
