@@ -1150,9 +1150,18 @@ static util::Result<SelectionResult> GutterGuard(const CAmount& target,
 BOOST_AUTO_TEST_CASE(gg_tests)
 {
     // Test GutterGuard:
-    // 1) Insufficient funds
-    // 2) Exceeded max weight, coin selection always surpasses the max allowed weight.
-    // 3) Select coins without surpassing the max weight (some coins surpasses the max allowed weight, some others not)
+    // 1) No coins in wallet
+    // 2) Test with zero target
+    // 3) Insufficient funds, select all provided coins and fail
+    // 4) Exceeded max weight, coin selection always surpasses the max allowed weight.
+    // 5) Select coins without surpassing the max weight (some coins surpasses the max allowed weight, some others not)
+    // 6) Sufficient funds, less than gutter_guard coins
+    // 7) Sufficient funds, equal to gutter_guard coins
+    // 8) Sufficient funds, greater than gutter_guard coins
+    // 9) Sufficient funds, indirectly test random selection with gutter guard limit
+
+    const int gutter_guard = 3;
+    const int max_weight = 10000;
 
     FastRandomContext rand;
     CoinSelectionParams dummy_params{ // Only used to provide the 'avoid_partial' flag.
@@ -1168,11 +1177,36 @@ BOOST_AUTO_TEST_CASE(gg_tests)
     };
 
     {
+        // #####################
+        // 1) No coins in wallet
+        // #####################
+        CAmount target = 1L * COIN;
+        const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
+            CoinsResult available_coins; // No coins added
+            return available_coins;
+        });
+        BOOST_CHECK(!res);
+        BOOST_CHECK(util::ErrorString(res).empty()); // empty means "insufficient funds"
+    }
+
+    {
+        // ########################
+        // 2) Test with zero target
+        // ########################
+        CAmount target = 0L * COIN;
+        const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
+            CoinsResult available_coins;
+            add_coin(available_coins, wallet, CAmount(1 * COIN));
+            return available_coins;
+        });
+        BOOST_CHECK(res);
+    }
+
+    {
         // #########################################################
-        // 1) Insufficient funds, select all provided coins and fail
+        // 3) Insufficient funds, select all provided coins and fail
         // #########################################################
         CAmount target = 49.5L * COIN;
-        int max_weight = 10000; // high enough to not fail for this reason.
         const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
             CoinsResult available_coins;
             for (int j = 0; j < 10; ++j) {
@@ -1186,9 +1220,9 @@ BOOST_AUTO_TEST_CASE(gg_tests)
     }
 
     {
-        // ###########################
-        // 2) Test max weight exceeded
-        // ###########################
+        // ##############################################################################
+        // 4) Exceeded max weight, coin selection always surpasses the max allowed weight
+        // ##############################################################################
         CAmount target = 29.5L * COIN;
         int max_weight = 3000;
         const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
@@ -1205,10 +1239,9 @@ BOOST_AUTO_TEST_CASE(gg_tests)
 
     {
         // ################################################################################################################
-        // 3) Test selection when some coins surpass the max allowed weight while others not. --> must find a good solution
+        // 5) Test selection when some coins surpass the max allowed weight while others not. --> must find a good solution
         // ################################################################################################################
         CAmount target = 25.33L * COIN;
-        int max_weight = 10000; // WU
         const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
             CoinsResult available_coins;
             for (int j = 0; j < 60; ++j) { // 60 UTXO --> 19,8 BTC total --> 60 × 272 WU = 16320 WU
@@ -1220,6 +1253,86 @@ BOOST_AUTO_TEST_CASE(gg_tests)
             return available_coins;
         });
         BOOST_CHECK(res);
+    }
+
+    {
+        // #################################################
+        // 6) Sufficient funds, less than gutter_guard coins
+        // #################################################
+        CAmount target = 1L * COIN;
+        const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
+            CoinsResult available_coins;
+            // create wallet with gutter_guard-1 total coins
+            for (int i = 0; i < (gutter_guard - 1); ++i) {
+                add_coin(available_coins, wallet, CAmount(1 * COIN));
+            }
+            return available_coins;
+        });
+        BOOST_CHECK(res);
+    }
+
+    {
+        // ################################################
+        // 7) Sufficient funds, equal to gutter_guard coins
+        // ################################################
+        CAmount target = 1L * COIN;
+        const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
+            CoinsResult available_coins;
+            // create wallet with gutter_guard total coins
+            for (int i = 0; i < gutter_guard; ++i) {
+                add_coin(available_coins, wallet, CAmount(1 * COIN));
+            }
+            return available_coins;
+        });
+        BOOST_CHECK(res);
+    }
+
+    {
+        // ####################################################
+        // 8) Sufficient funds, greater than gutter_guard coins
+        // ####################################################
+        CAmount target = 7L * COIN;
+        const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
+            CoinsResult available_coins;
+            // create wallet with > gutter_guard coins
+            for (int i = 0; i < (gutter_guard + 10); ++i) {
+                add_coin(available_coins, wallet, CAmount(1 * COIN));
+            }
+            return available_coins;
+        });
+        BOOST_CHECK(res);
+    }
+
+    {
+        // #############################################################################
+        // 9) Sufficient funds, indirectly test random selection with gutter guard limit
+        // #############################################################################
+        CAmount target = 1277L * COIN;
+        for (int j = 0; j < 10; ++j) { // run loop 10x
+            const auto& res = GutterGuard(target, dummy_params, m_node, max_weight, [&](CWallet& wallet) {
+                CoinsResult available_coins;
+                // Values selected such that every result that satisfies `target` CAmount requires at least 2 coins
+                // at least one of which must be the greatest value coin (follows from 1277 > SUM(50+49+...+0))
+                add_coin(available_coins, wallet, CAmount(1276 * COIN));
+
+                for (int i = 50; i > 0; --i) {
+                    add_coin(available_coins, wallet, CAmount(i * COIN)); // add coin amounts in descending order
+                }
+                return available_coins;
+            });
+
+            BOOST_CHECK(res);
+            // Verify that the 1276 BTC UTXO was selected
+            const auto& selection_res = res->GetInputSet();
+            bool has_coin = false;
+            for (const auto& coin : selection_res) {
+                if (coin->GetEffectiveValue() == 1276 * COIN) {
+                    has_coin = true;
+                    break;
+                }
+            }
+            BOOST_CHECK(has_coin);
+        }
     }
 }
 
